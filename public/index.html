@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WatchParty</title>
+<script src="https://cdn.jsdelivr.net/npm/hls.js@1.5.17/dist/hls.min.js"></script>
+<script src="/socket.io/socket.io.js"></script>
+<style>
+:root{--bg:#fff;--fg:#1a1a1a;--card:#f3f3f5;--accent:#5b5bd6}
+@media(prefers-color-scheme:dark){:root{--bg:#121214;--fg:#eee;--card:#1e1e22}}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg)}
+.wrap{max-width:1100px;margin:0 auto;padding:16px}
+input,button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid #8884;background:var(--card);color:var(--fg)}
+button{background:var(--accent);color:#fff;border:0;cursor:pointer}
+#join{display:flex;gap:8px;flex-wrap:wrap;margin-top:20vh;justify-content:center}
+#app{display:none;grid-template-columns:1fr 300px;gap:16px}
+video{width:100%;background:#000;border-radius:10px;max-height:70vh}
+.side{background:var(--card);border-radius:10px;padding:12px;display:flex;flex-direction:column;height:70vh}
+#log{flex:1;overflow:auto;font-size:14px}#log p{margin:4px 0}.sys{opacity:.6;font-style:italic}
+.row{display:flex;gap:8px;margin-top:8px}.row input{flex:1;min-width:0}
+#status{font-size:13px;opacity:.7;margin:6px 0}
+@media(max-width:800px){#app{grid-template-columns:1fr}.side{height:300px}}
+</style></head><body><div class="wrap">
+<h2>🎬 WatchParty</h2>
+<div id="join">
+  <input id="name" placeholder="Your name">
+  <input id="room" placeholder="Room code">
+  <button id="go">Join / Create</button>
+</div>
+<div id="app">
+  <div>
+    <div class="row">
+      <input id="url" placeholder="Video URL (.mp4 or .m3u8)">
+      <button id="load">Load for all</button>
+      <button id="local" style="background:#666">Use local file</button>
+      <input id="file" type="file" accept="video/*" hidden>
+    </div>
+    <video id="v" controls playsinline></video>
+    <div id="status"></div>
+  </div>
+  <div class="side"><b id="users"></b><div id="log"></div>
+    <div class="row"><input id="msg" placeholder="Chat…"><button id="send">Send</button></div></div>
+</div></div>
+<script>
+const $ = (id) => document.getElementById(id);
+const v = $("v"), socket = io();
+let offset = 0, state = null, ignoreUntil = 0, hls = null, localMode = false;
+
+const serverNow = () => Date.now() + offset;
+const expected = () => state ? state.position + (state.playing ? (serverNow() - state.updatedAt) / 1000 : 0) : 0;
+const quiet = () => (ignoreUntil = Date.now() + 600); // suppress echo from our own remote-applied changes
+
+// ---- clock sync: keep the sample with the smallest round-trip ----
+async function syncClock() {
+  let best = { rtt: Infinity, off: 0 };
+  for (let i = 0; i < 6; i++) {
+    const t0 = Date.now();
+    const s = await new Promise((r) => socket.emit("time", r));
+    const rtt = Date.now() - t0;
+    if (rtt < best.rtt) best = { rtt, off: s + rtt / 2 - Date.now() };
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  offset = best.off;
+}
+
+// ---- load a video source ----
+function loadSource(url) {
+  if (hls) { hls.destroy(); hls = null; }
+  if (url.includes(".m3u8") && window.Hls && Hls.isSupported()) {
+    hls = new Hls(); hls.loadSource(url); hls.attachMedia(v);
+  } else v.src = url;
+}
+
+// ---- apply server state ----
+function apply(s) {
+  const urlChanged = !state || s.url !== state.url;
+  state = s;
+  if (urlChanged && s.url && !localMode) { $("url").value = s.url; loadSource(s.url); }
+  quiet();
+  const t = expected();
+  if (Math.abs(v.currentTime - t) > 0.5) v.currentTime = t;
+  if (s.playing) v.play().catch(() => ($("status").textContent = "Click the video to allow playback"));
+  else v.pause();
+}
+
+// ---- send local actions ----
+const send = () => { if (Date.now() < ignoreUntil) return;
+  state = { ...state, playing: !v.paused, position: v.currentTime, updatedAt: serverNow() };
+  socket.emit("control", { playing: !v.paused, position: v.currentTime }); };
+["play", "pause", "seeked"].forEach((e) => v.addEventListener(e, send));
+
+// ---- drift correction every 2s ----
+setInterval(() => {
+  if (!state || !state.playing || v.paused) { v.playbackRate = 1; return; }
+  const drift = v.currentTime - expected();
+  const a = Math.abs(drift);
+  if (a > 2) { quiet(); v.currentTime = expected(); v.playbackRate = 1; }
+  else if (a > 0.3) v.playbackRate = drift > 0 ? 0.95 : 1.05;
+  else v.playbackRate = 1;
+  $("status").textContent = `drift ${(drift * 1000).toFixed(0)} ms`;
+}, 2000);
+
+// ---- UI ----
+socket.on("state", apply);
+socket.on("users", (u) => ($("users").textContent = `👥 ${u.length}: ${u.join(", ")}`));
+socket.on("chat", (m) => {
+  const p = document.createElement("p");
+  if (m.system) { p.className = "sys"; p.textContent = m.text; }
+  else { const b = document.createElement("b"); b.textContent = m.name + ": "; p.append(b, m.text); }
+  $("log").appendChild(p); $("log").scrollTop = 1e9;
+});
+
+async function join() {
+  const room = $("room").value.trim(), name = $("name").value.trim() || "Guest";
+  if (!room) return;
+  location.hash = room;
+  $("join").style.display = "none"; $("app").style.display = "grid";
+  await syncClock();
+  socket.emit("join", { room, name });
+}
+$("go").onclick = join;
+$("room").value = location.hash.slice(1);
+$("load").onclick = () => $("url").value && socket.emit("set-url", $("url").value.trim());
+$("local").onclick = () => $("file").click();
+$("file").onchange = (e) => { const f = e.target.files[0]; if (!f) return;
+  localMode = true; v.src = URL.createObjectURL(f); if (state) apply(state);
+  $("status").textContent = "Local file mode: everyone must pick the same file"; };
+const sendChat = () => { if ($("msg").value) { socket.emit("chat", $("msg").value); $("msg").value = ""; } };
+$("send").onclick = sendChat; $("msg").onkeydown = (e) => e.key === "Enter" && sendChat();
+</script></body></html>
