@@ -18,7 +18,7 @@ video{width:100%;background:#000;border-radius:10px;max-height:70vh}
 #ytwrap iframe{width:100%;aspect-ratio:16/9;border:0;border-radius:10px;background:#000}
 .side{background:var(--card);border-radius:10px;padding:12px;display:flex;flex-direction:column;height:70vh}
 #log{flex:1;overflow:auto;font-size:14px}#log p{margin:4px 0}.sys{opacity:.6;font-style:italic}
-.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap}.row input{flex:1;min-width:0}
+.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}.row input[type=text],.row input:not([type]){flex:1;min-width:0}
 #status{font-size:13px;opacity:.7;margin:6px 0}
 @media(max-width:800px){#app{grid-template-columns:1fr}.side{height:300px}}
 </style></head><body><div class="wrap">
@@ -36,6 +36,7 @@ video{width:100%;background:#000;border-radius:10px;max-height:70vh}
       <button id="sample" style="background:#2a8">Try sample</button>
       <button id="local" style="background:#666">Use local file</button>
       <input id="file" type="file" accept="video/*" hidden>
+      <label id="hostbox" style="display:none;align-items:center;gap:6px"><input type="checkbox" id="honly" style="flex:none"> 👑 Only I control</label>
     </div>
     <video id="v" controls playsinline></video>
     <div id="ytwrap"><div id="ytbox"></div></div>
@@ -51,6 +52,7 @@ const say = (t) => ($("status").textContent = t);
 let offset = 0, state = null, ignoreUntil = 0, hls = null, localMode = false;
 let P = null;                       // current player adapter (html5 or youtube)
 let yt = null, ytReady = false;
+let joined = null, waitNames = [];
 
 const serverNow = () => Date.now() + offset;
 const expected = () => state ? state.position + (state.playing ? (serverNow() - state.updatedAt) / 1000 : 0) : 0;
@@ -107,7 +109,11 @@ function showYouTube(id) {
         onReady: () => { ytReady = true; P = ytAdapter; say("✅ YouTube ready. Press play."); applyPlayback(); },
         onStateChange: (e) => {
           if (e.data === 5) { P = ytAdapter; say("✅ YouTube ready. Press play."); applyPlayback(); }
-          else if ((e.data === 1 || e.data === 2) && P === ytAdapter) send();
+          else if (e.data === 3) buffering(true);
+          else if (e.data === 1 || e.data === 2) {
+            if (e.data === 1) buffering(false);
+            if (P === ytAdapter) send();
+          }
         },
         onError: (e) => say("❌ YouTube error " + e.data + ": this video may not allow embedding. Try another."),
       },
@@ -177,8 +183,24 @@ setInterval(() => {
   if (P === ytAdapter) { if (a > 1) { quiet(); P.seek(expected()); } }  // YouTube lacks fine speed steps
   else if (a > 2) { quiet(); P.seek(expected()); v.playbackRate = 1; }
   else v.playbackRate = a > 0.3 ? (drift > 0 ? 0.95 : 1.05) : 1;
-  say(`drift ${(drift * 1000).toFixed(0)} ms`);
+  if (!waitNames.length) say(`drift ${(drift * 1000).toFixed(0)} ms`);
 }, 2000);
+
+// ---------- buffering + host control ----------
+const buffering = (b) => socket.emit("buffering", b);
+v.addEventListener("waiting", () => P === html5 && buffering(true));
+["canplay", "playing"].forEach((e) => v.addEventListener(e, () => P === html5 && buffering(false)));
+socket.on("wait", ({ names }) => {
+  const wasWaiting = waitNames.length > 0;
+  waitNames = names;
+  if (names.length) say("⏳ Waiting for " + names.join(", ") + " to buffer…");
+  else if (wasWaiting) say("▶ Resumed");
+});
+socket.on("room", ({ hostId, hostOnly }) => {
+  $("hostbox").style.display = hostId === socket.id ? "inline-flex" : "none";
+  $("honly").checked = hostOnly;
+});
+$("honly").onchange = (e) => socket.emit("set-host-only", e.target.checked);
 
 // ---------- misc handlers ----------
 v.addEventListener("error", () => {
@@ -200,16 +222,27 @@ socket.on("chat", (m) => {
   $("log").appendChild(p); $("log").scrollTop = 1e9;
 });
 
+// ---------- join + reconnect ----------
 async function join() {
   const room = $("room").value.trim(), name = $("name").value.trim() || "Guest";
   if (!room) return;
   location.hash = room;
   $("join").style.display = "none"; $("app").style.display = "grid";
   await syncClock();
-  socket.emit("join", { room, name });
+  joined = { room, name };
+  socket.emit("join", joined);
 }
+socket.on("disconnect", () => say("⚠️ Connection lost. Reconnecting…"));
+socket.on("connect", async () => {
+  if (!joined) return;           // first connection is handled by join()
+  await syncClock();
+  socket.emit("join", joined);   // re-enter the room after a reconnect
+  say("✅ Reconnected");
+});
 $("go").onclick = join;
 $("room").value = location.hash.slice(1);
+
+// ---------- buttons ----------
 $("load").onclick = () => $("url").value && socket.emit("set-url", $("url").value.trim());
 $("sample").onclick = () => socket.emit("set-url", "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4");
 $("local").onclick = () => $("file").click();
@@ -219,6 +252,10 @@ $("file").onchange = (e) => {
   P = html5; v.src = URL.createObjectURL(f); applyPlayback();
   say("Local file mode: everyone must pick the same file");
 };
-const sendChat = () => { if ($("msg").value) { socket.emit("chat", $("msg").value); $("msg").value = ""; } };
-$("send").onclick = sendChat; $("msg").onkeydown = (e) => e.key === "Enter" && sendChat();
+const sendChat = () => {
+  if (!socket.connected) return say("⚠️ Not connected. Wait for it to reconnect.");
+  if ($("msg").value) { socket.emit("chat", $("msg").value); $("msg").value = ""; }
+};
+$("send").onclick = sendChat;
+$("msg").onkeydown = (e) => e.key === "Enter" && sendChat();
 </script></body></html>
