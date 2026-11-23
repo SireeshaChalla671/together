@@ -2,10 +2,11 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 
+const VERSION = "v4";
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
-app.use(express.static("public"));
+app.use(express.static("public", { etag: false, maxAge: 0 })); // no caching while developing
 
 // roomId -> { url, playing, position, updatedAt, resumeAfter, hostId, hostOnly, members, waiting, holdTimer }
 const rooms = new Map();
@@ -42,6 +43,7 @@ function updateWait(id, r) {
 
 io.on("connection", (socket) => {
   let roomId = null;
+  socket.emit("hello", { version: VERSION });
 
   socket.on("time", (cb) => cb(Date.now()));
 
@@ -94,9 +96,19 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("chat", { system: true, text: r.hostOnly ? "Host-only control is ON" : "Everyone can control playback" });
   });
 
-  socket.on("chat", (text) => {
-    const r = rooms.get(roomId); if (!r) return;
-    io.to(roomId).emit("chat", { name: r.members.get(socket.id), text: String(text).slice(0, 500) });
+  // Chat: accepts both the old format (plain text) and the new one ({ room, name, text })
+  socket.on("chat", (msg, ack) => {
+    const reply = (o) => typeof ack === "function" && ack(o);
+    const isObj = msg && typeof msg === "object";
+    const room = String((isObj && msg.room) || roomId || "").slice(0, 40);
+    const text = String(isObj ? msg.text : msg || "").trim().slice(0, 500);
+    const r = rooms.get(roomId);
+    const name = String((isObj && msg.name) || (r && r.members.get(socket.id)) || "Guest").slice(0, 24);
+    if (!room || !text) return reply({ ok: false });
+    if (!socket.rooms.has(room)) socket.join(room);
+    console.log(`[chat] room=${room} ${name}: ${text}`);
+    io.to(room).emit("chat", { name, text });
+    reply({ ok: true });
   });
 
   socket.on("disconnect", () => {
@@ -112,4 +124,4 @@ io.on("connection", (socket) => {
 });
 
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`Together running on http://localhost:${PORT}`));
+server.listen(PORT, () => console.log(`Together ${VERSION} running on http://localhost:${PORT}`));

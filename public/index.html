@@ -17,8 +17,9 @@ video{width:100%;background:#000;border-radius:10px;max-height:70vh}
 #ytwrap{display:none}
 #ytwrap iframe{width:100%;aspect-ratio:16/9;border:0;border-radius:10px;background:#000}
 .side{background:var(--card);border-radius:10px;padding:12px;display:flex;flex-direction:column;height:70vh}
-#log{flex:1;overflow:auto;font-size:14px}#log p{margin:4px 0}.sys{opacity:.6;font-style:italic}
-.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}.row input[type=text],.row input:not([type]){flex:1;min-width:0}
+#log{flex:1;min-height:0;overflow:auto;font-size:14px}#log p{margin:4px 0}.sys{opacity:.6;font-style:italic}
+.row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}
+.row input[type=text],.row input:not([type]){flex:1;min-width:0}
 #status{font-size:13px;opacity:.7;margin:6px 0}
 @media(max-width:800px){#app{grid-template-columns:1fr}.side{height:300px}}
 </style></head><body><div class="wrap">
@@ -57,6 +58,15 @@ let joined = null, waitNames = [];
 const serverNow = () => Date.now() + offset;
 const expected = () => state ? state.position + (state.playing ? (serverNow() - state.updatedAt) / 1000 : 0) : 0;
 const quiet = () => (ignoreUntil = Date.now() + 1000); // ignore echoes of remote-applied changes
+
+// ---------- chat log ----------
+const addLog = (m) => {
+  const p = document.createElement("p");
+  if (m.system) { p.className = "sys"; p.textContent = m.text; }
+  else { const b = document.createElement("b"); b.textContent = m.name + ": "; p.append(b, m.text); }
+  $("log").appendChild(p); $("log").scrollTop = 1e9;
+};
+socket.on("chat", addLog);
 
 // ---------- player adapters ----------
 const html5 = {
@@ -215,12 +225,6 @@ v.addEventListener("click", () => { if (!v.currentSrc) say("⚠️ No video load
 socket.on("connect_error", () => say("❌ Cannot reach the server. Open http://localhost:3000"));
 socket.on("state", apply);
 socket.on("users", (u) => ($("users").textContent = `👥 ${u.length}: ${u.join(", ")}`));
-socket.on("chat", (m) => {
-  const p = document.createElement("p");
-  if (m.system) { p.className = "sys"; p.textContent = m.text; }
-  else { const b = document.createElement("b"); b.textContent = m.name + ": "; p.append(b, m.text); }
-  $("log").appendChild(p); $("log").scrollTop = 1e9;
-});
 
 // ---------- join + reconnect ----------
 async function join() {
@@ -252,10 +256,26 @@ $("file").onchange = (e) => {
   P = html5; v.src = URL.createObjectURL(f); applyPlayback();
   say("Local file mode: everyone must pick the same file");
 };
-const sendChat = () => {
-  if (!socket.connected) return say("⚠️ Not connected. Wait for it to reconnect.");
-  if ($("msg").value) { socket.emit("chat", $("msg").value); $("msg").value = ""; }
-};
+
+// ---------- sending chat (with delivery check + auto re-join) ----------
+async function sendChat() {
+  const text = $("msg").value.trim();
+  if (!text) return;
+  if (!socket.connected) return addLog({ system: true, text: "⚠️ Not connected to the server. Refresh the page." });
+  if (!joined) return addLog({ system: true, text: "⚠️ You haven't joined a room yet." });
+  $("msg").value = "";
+  const trySend = () => new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), 3000);
+    socket.emit("chat", text, (res) => { clearTimeout(timer); resolve(res); });
+  });
+  let res = await trySend();
+  if (!res || !res.ok) {                 // server forgot us: re-join, then retry once
+    socket.emit("join", joined);
+    await new Promise((r) => setTimeout(r, 400));
+    res = await trySend();
+  }
+  if (!res || !res.ok) addLog({ system: true, text: "❌ Message not delivered. Refresh the page and rejoin." });
+}
 $("send").onclick = sendChat;
 $("msg").onkeydown = (e) => e.key === "Enter" && sendChat();
 </script></body></html>
