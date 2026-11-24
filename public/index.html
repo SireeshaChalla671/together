@@ -8,29 +8,36 @@
 :root{--bg:#fff;--fg:#1a1a1a;--card:#f3f3f5;--accent:#5b5bd6}
 @media(prefers-color-scheme:dark){:root{--bg:#121214;--fg:#eee;--card:#1e1e22}}
 *{box-sizing:border-box}body{margin:0;font-family:system-ui,sans-serif;background:var(--bg);color:var(--fg)}
-.wrap{max-width:1100px;margin:0 auto;padding:16px}
+.wrap{max-width:1150px;margin:0 auto;padding:16px}
 input,button{font:inherit;padding:8px 12px;border-radius:8px;border:1px solid #8884;background:var(--card);color:var(--fg)}
 button{background:var(--accent);color:#fff;border:0;cursor:pointer}
 #join{display:flex;gap:8px;flex-wrap:wrap;margin-top:20vh;justify-content:center}
-#app{display:none;grid-template-columns:1fr 300px;gap:16px}
+#app{display:none;grid-template-columns:minmax(0,1fr) 320px;gap:16px;align-items:start}
+.main{min-width:0}
 video{width:100%;background:#000;border-radius:10px;max-height:70vh}
 #ytwrap{display:none}
 #ytwrap iframe{width:100%;aspect-ratio:16/9;border:0;border-radius:10px;background:#000}
-.side{background:var(--card);border-radius:10px;padding:12px;display:flex;flex-direction:column;height:70vh}
-#log{flex:1;min-height:0;overflow:auto;font-size:14px}#log p{margin:4px 0}.sys{opacity:.6;font-style:italic}
+.side{background:var(--card);border-radius:10px;padding:12px;display:flex;flex-direction:column;height:75vh;min-height:360px;overflow:hidden}
+#chathead{font-size:13px;opacity:.8;margin-bottom:6px;display:flex;justify-content:space-between;gap:8px}
+#users,#vlist{font-size:13px;margin-bottom:6px}
+#log{flex:1;min-height:0;overflow-y:auto;font-size:14px;border-top:1px solid #8883;padding-top:6px}
+#log p{margin:4px 0;word-break:break-word}.sys{opacity:.65;font-style:italic}
 .row{display:flex;gap:8px;margin-top:8px;flex-wrap:wrap;align-items:center}
 .row input[type=text],.row input:not([type]){flex:1;min-width:0}
+#chatrow{flex-wrap:nowrap}
+#voicerow{margin:0 0 6px}
 #status{font-size:13px;opacity:.7;margin:6px 0}
-@media(max-width:800px){#app{grid-template-columns:1fr}.side{height:300px}}
+.ver{font-size:12px;opacity:.5;font-weight:normal}
+@media(max-width:800px){#app{grid-template-columns:minmax(0,1fr)}.side{height:420px}}
 </style></head><body><div class="wrap">
-<h2>🎬 Together</h2>
+<h2>🎬 Together <span class="ver">v5</span></h2>
 <div id="join">
   <input id="name" placeholder="Your name">
   <input id="room" placeholder="Room code">
   <button id="go">Join / Create</button>
 </div>
 <div id="app">
-  <div>
+  <div class="main">
     <div class="row">
       <input id="url" placeholder="YouTube link, or direct .mp4 / .m3u8 URL">
       <button id="load">Load for all</button>
@@ -43,30 +50,144 @@ video{width:100%;background:#000;border-radius:10px;max-height:70vh}
     <div id="ytwrap"><div id="ytbox"></div></div>
     <div id="status"></div>
   </div>
-  <div class="side"><b id="users"></b><div id="log"></div>
-    <div class="row"><input id="msg" placeholder="Chat…"><button id="send">Send</button></div></div>
+  <div class="side">
+    <div id="chathead"><b>💬 Chat &amp; voice</b><span id="net">● connecting…</span></div>
+    <div class="row" id="voicerow">
+      <button id="vjoin" style="background:#2a8">🎤 Join voice</button>
+      <button id="vmute" style="display:none;background:#666">Mute</button>
+      <button id="vleave" style="display:none;background:#d33">Leave voice</button>
+    </div>
+    <div id="vlist"></div>
+    <div id="users"></div>
+    <div id="log"></div>
+    <div class="row" id="chatrow"><input id="msg" placeholder="Type a message…" autocomplete="off"><button id="send">Send</button></div>
+  </div>
 </div></div>
 <script>
+const VERSION = "v5";
 const $ = (id) => document.getElementById(id);
 const v = $("v"), socket = io();
 const say = (t) => ($("status").textContent = t);
 let offset = 0, state = null, ignoreUntil = 0, hls = null, localMode = false;
-let P = null;                       // current player adapter (html5 or youtube)
-let yt = null, ytReady = false;
-let joined = null, waitNames = [];
+let P = null, yt = null, ytReady = false;
+let joined = null, waitNames = [], gotHello = false;
 
 const serverNow = () => Date.now() + offset;
 const expected = () => state ? state.position + (state.playing ? (serverNow() - state.updatedAt) / 1000 : 0) : 0;
-const quiet = () => (ignoreUntil = Date.now() + 1000); // ignore echoes of remote-applied changes
+const quiet = () => (ignoreUntil = Date.now() + 1000);
 
-// ---------- chat log ----------
+// ---------- chat ----------
 const addLog = (m) => {
   const p = document.createElement("p");
   if (m.system) { p.className = "sys"; p.textContent = m.text; }
   else { const b = document.createElement("b"); b.textContent = m.name + ": "; p.append(b, m.text); }
-  $("log").appendChild(p); $("log").scrollTop = 1e9;
+  $("log").appendChild(p); $("log").scrollTop = $("log").scrollHeight;
 };
+const setNet = (on) => { $("net").textContent = on ? "● online" : "● offline"; $("net").style.color = on ? "#2a8" : "#d33"; };
 socket.on("chat", addLog);
+socket.on("hello", (h) => {
+  gotHello = true;
+  if (h.version !== VERSION) addLog({ system: true, text: `⚠️ Server is ${h.version} but page is ${VERSION}. Restart 'npm start' and hard refresh.` });
+});
+socket.on("disconnect", () => { setNet(false); say("⚠️ Connection lost. Reconnecting…"); });
+
+async function sendChat() {
+  const text = $("msg").value.trim();
+  if (!text) return;
+  if (!joined) return addLog({ system: true, text: "⚠️ Join a room first." });
+  if (!socket.connected) return addLog({ system: true, text: "⚠️ Offline. Reconnecting…" });
+  $("msg").value = "";
+  const ok = await new Promise((resolve) => {
+    const t = setTimeout(() => resolve(false), 3000);
+    socket.emit("chat", { room: joined.room, name: joined.name, text }, (r) => { clearTimeout(t); resolve(!!(r && r.ok)); });
+  });
+  if (!ok) addLog({ system: true, text: "❌ Not delivered: " + text });
+}
+$("send").onclick = sendChat;
+["keydown", "keyup", "keypress"].forEach((ev) => $("msg").addEventListener(ev, (e) => e.stopPropagation()));
+$("msg").addEventListener("keydown", (e) => { if (e.key === "Enter") { e.preventDefault(); sendChat(); } });
+
+// ---------- voice calling (WebRTC, peer-to-peer audio) ----------
+const ICE = { iceServers: [{ urls: "stun:stun.l.google.com:19302" }, { urls: "stun:stun1.l.google.com:19302" }] };
+let localStream = null;
+const peers = new Map(); // socketId -> { pc, name, audio, pending }
+
+const vui = () => {
+  const on = !!localStream;
+  $("vjoin").style.display = on ? "none" : "inline-block";
+  $("vmute").style.display = on ? "inline-block" : "none";
+  $("vleave").style.display = on ? "inline-block" : "none";
+  $("vlist").textContent = on ? "🎙️ In voice: you" + [...peers.values()].map((p) => ", " + p.name).join("") : "";
+};
+const flush = async (p) => { for (const c of p.pending.splice(0)) await p.pc.addIceCandidate(c).catch(() => {}); };
+
+function makePeer(id, name) {
+  const pc = new RTCPeerConnection(ICE);
+  const peer = { pc, name: name || "friend", audio: new Audio(), pending: [] };
+  peer.audio.autoplay = true;
+  localStream.getTracks().forEach((t) => pc.addTrack(t, localStream));
+  pc.onicecandidate = (e) => e.candidate && socket.emit("signal", { to: id, data: { candidate: e.candidate } });
+  pc.ontrack = (e) => { peer.audio.srcObject = e.streams[0]; peer.audio.play().catch(() => {}); };
+  pc.onconnectionstatechange = () => { if (["failed", "closed"].includes(pc.connectionState)) dropPeer(id); };
+  peers.set(id, peer); vui();
+  return peer;
+}
+function dropPeer(id) {
+  const p = peers.get(id); if (!p) return;
+  p.pc.close(); p.audio.srcObject = null; peers.delete(id); vui();
+}
+
+async function startVoice() {
+  if (!joined) return addLog({ system: true, text: "⚠️ Join a room first." });
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia)
+    return addLog({ system: true, text: "❌ Microphone needs https:// or http://localhost. Use the tunnel link." });
+  try {
+    localStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true } });
+  } catch (e) { return addLog({ system: true, text: "❌ Microphone blocked or not found: " + e.message }); }
+  vui();
+  socket.emit("voice-join");
+}
+function stopVoice() {
+  socket.emit("voice-leave");
+  [...peers.keys()].forEach(dropPeer);
+  if (localStream) localStream.getTracks().forEach((t) => t.stop());
+  localStream = null; $("vmute").textContent = "Mute"; vui();
+}
+
+// I just joined voice: the server tells me who is already in, and I call each of them
+socket.on("voice-peers", async (list) => {
+  for (const { id, name } of list) {
+    const p = makePeer(id, name);
+    const offer = await p.pc.createOffer();
+    await p.pc.setLocalDescription(offer);
+    socket.emit("signal", { to: id, data: { sdp: p.pc.localDescription } });
+  }
+});
+socket.on("signal", async ({ from, name, data }) => {
+  if (!localStream) return;
+  let p = peers.get(from);
+  if (data.sdp) {
+    if (data.sdp.type === "offer") {
+      if (!p) p = makePeer(from, name);
+      await p.pc.setRemoteDescription(data.sdp); await flush(p);
+      const ans = await p.pc.createAnswer();
+      await p.pc.setLocalDescription(ans);
+      socket.emit("signal", { to: from, data: { sdp: p.pc.localDescription } });
+    } else if (p) { await p.pc.setRemoteDescription(data.sdp); await flush(p); }
+  } else if (data.candidate && p) {
+    if (p.pc.remoteDescription) await p.pc.addIceCandidate(data.candidate).catch(() => {});
+    else p.pending.push(data.candidate);
+  }
+});
+socket.on("voice-left", dropPeer);
+
+$("vjoin").onclick = startVoice;
+$("vleave").onclick = stopVoice;
+$("vmute").onclick = () => {
+  const t = localStream && localStream.getAudioTracks()[0]; if (!t) return;
+  t.enabled = !t.enabled;
+  $("vmute").textContent = t.enabled ? "Mute" : "Unmute";
+};
 
 // ---------- player adapters ----------
 const html5 = {
@@ -84,7 +205,7 @@ const ytAdapter = {
   play: () => yt.playVideo(), pause: () => yt.pauseVideo(),
 };
 
-// ---------- clock sync (keep the lowest-RTT sample) ----------
+// ---------- clock sync ----------
 async function syncClock() {
   let best = { rtt: Infinity, off: 0 };
   for (let i = 0; i < 6; i++) {
@@ -176,7 +297,6 @@ function send() {
 }
 ["play", "pause", "seeked"].forEach((e) => v.addEventListener(e, () => P === html5 && send()));
 
-// YouTube has no "seeked" event, so detect jumps by polling
 let last = { t: 0, at: Date.now(), playing: false };
 setInterval(() => {
   if (P !== ytAdapter || !ytReady) return;
@@ -190,7 +310,7 @@ setInterval(() => {
 setInterval(() => {
   if (!P || !state || !state.playing || !P.playing()) { v.playbackRate = 1; return; }
   const drift = P.time() - expected(), a = Math.abs(drift);
-  if (P === ytAdapter) { if (a > 1) { quiet(); P.seek(expected()); } }  // YouTube lacks fine speed steps
+  if (P === ytAdapter) { if (a > 1) { quiet(); P.seek(expected()); } }
   else if (a > 2) { quiet(); P.seek(expected()); v.playbackRate = 1; }
   else v.playbackRate = a > 0.3 ? (drift > 0 ? 0.95 : 1.05) : 1;
   if (!waitNames.length) say(`drift ${(drift * 1000).toFixed(0)} ms`);
@@ -212,7 +332,7 @@ socket.on("room", ({ hostId, hostOnly }) => {
 });
 $("honly").onchange = (e) => socket.emit("set-host-only", e.target.checked);
 
-// ---------- misc handlers ----------
+// ---------- misc ----------
 v.addEventListener("error", () => {
   if (P !== html5) return;
   const c = v.error && v.error.code;
@@ -236,11 +356,12 @@ async function join() {
   joined = { room, name };
   socket.emit("join", joined);
 }
-socket.on("disconnect", () => say("⚠️ Connection lost. Reconnecting…"));
 socket.on("connect", async () => {
-  if (!joined) return;           // first connection is handled by join()
+  setNet(true);
+  if (!joined) return;
+  if (localStream) { stopVoice(); addLog({ system: true, text: "⚠️ Connection dropped, so voice ended. Click Join voice again." }); }
   await syncClock();
-  socket.emit("join", joined);   // re-enter the room after a reconnect
+  socket.emit("join", joined);
   say("✅ Reconnected");
 });
 $("go").onclick = join;
@@ -256,26 +377,4 @@ $("file").onchange = (e) => {
   P = html5; v.src = URL.createObjectURL(f); applyPlayback();
   say("Local file mode: everyone must pick the same file");
 };
-
-// ---------- sending chat (with delivery check + auto re-join) ----------
-async function sendChat() {
-  const text = $("msg").value.trim();
-  if (!text) return;
-  if (!socket.connected) return addLog({ system: true, text: "⚠️ Not connected to the server. Refresh the page." });
-  if (!joined) return addLog({ system: true, text: "⚠️ You haven't joined a room yet." });
-  $("msg").value = "";
-  const trySend = () => new Promise((resolve) => {
-    const timer = setTimeout(() => resolve(null), 3000);
-    socket.emit("chat", text, (res) => { clearTimeout(timer); resolve(res); });
-  });
-  let res = await trySend();
-  if (!res || !res.ok) {                 // server forgot us: re-join, then retry once
-    socket.emit("join", joined);
-    await new Promise((r) => setTimeout(r, 400));
-    res = await trySend();
-  }
-  if (!res || !res.ok) addLog({ system: true, text: "❌ Message not delivered. Refresh the page and rejoin." });
-}
-$("send").onclick = sendChat;
-$("msg").onkeydown = (e) => e.key === "Enter" && sendChat();
 </script></body></html>

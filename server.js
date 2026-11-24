@@ -2,19 +2,18 @@ const express = require("express");
 const http = require("http");
 const { Server } = require("socket.io");
 
-const VERSION = "v4";
+const VERSION = "v5";
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 app.use(express.static("public", { etag: false, maxAge: 0 })); // no caching while developing
 
-// roomId -> { url, playing, position, updatedAt, resumeAfter, hostId, hostOnly, members, waiting, holdTimer }
 const rooms = new Map();
 const getRoom = (id) => {
   if (!rooms.has(id)) rooms.set(id, {
     url: "", playing: false, position: 0, updatedAt: Date.now(),
     resumeAfter: false, hostId: null, hostOnly: false,
-    members: new Map(), waiting: new Set(), holdTimer: null,
+    members: new Map(), waiting: new Set(), voice: new Set(), holdTimer: null,
   });
   return rooms.get(id);
 };
@@ -25,10 +24,9 @@ const sendRoom = (id, r) => io.to(id).emit("room", { hostId: r.hostId, hostOnly:
 const canControl = (socket, r) => !r.hostOnly || r.hostId === socket.id;
 const deny = (socket, r) => {
   socket.emit("chat", { system: true, text: "Only the host can do that right now" });
-  socket.emit("state", publicState(r)); // snap the client back
+  socket.emit("state", publicState(r));
 };
 
-// After any change to the "who is buffering" set: tell everyone, and resume if nobody is waiting
 function updateWait(id, r) {
   io.to(id).emit("wait", { names: [...r.waiting].map((s) => r.members.get(s)).filter(Boolean) });
   if (r.waiting.size === 0) {
@@ -44,7 +42,6 @@ function updateWait(id, r) {
 io.on("connection", (socket) => {
   let roomId = null;
   socket.emit("hello", { version: VERSION });
-
   socket.on("time", (cb) => cb(Date.now()));
 
   socket.on("join", ({ room, name }) => {
@@ -52,7 +49,7 @@ io.on("connection", (socket) => {
     const r = getRoom(roomId);
     socket.join(roomId);
     r.members.set(socket.id, String(name || "Guest").slice(0, 24));
-    if (!r.hostId || !r.members.has(r.hostId)) r.hostId = socket.id; // first person in becomes host
+    if (!r.hostId || !r.members.has(r.hostId)) r.hostId = socket.id;
     socket.emit("state", publicState(r));
     sendUsers(roomId, r);
     sendRoom(roomId, r);
@@ -69,7 +66,7 @@ io.on("connection", (socket) => {
   socket.on("control", ({ playing, position }) => {
     const r = rooms.get(roomId); if (!r) return;
     if (!canControl(socket, r)) return deny(socket, r);
-    r.resumeAfter = false; // a manual action cancels any automatic resume
+    r.resumeAfter = false;
     Object.assign(r, { playing: !!playing, position: Number(position) || 0, updatedAt: Date.now() });
     socket.to(roomId).emit("state", publicState(r));
   });
@@ -79,11 +76,11 @@ io.on("connection", (socket) => {
     if (isBuffering) {
       if (r.waiting.has(socket.id)) return;
       r.waiting.add(socket.id);
-      if (r.playing) { // freeze the room at the current position
+      if (r.playing) {
         Object.assign(r, { position: currentPos(r), playing: false, updatedAt: Date.now(), resumeAfter: true });
         io.to(roomId).emit("state", publicState(r));
         clearTimeout(r.holdTimer);
-        r.holdTimer = setTimeout(() => { r.waiting.clear(); updateWait(roomId, r); }, 15000); // never hold forever
+        r.holdTimer = setTimeout(() => { r.waiting.clear(); updateWait(roomId, r); }, 15000);
       }
     } else r.waiting.delete(socket.id);
     updateWait(roomId, r);
@@ -96,7 +93,7 @@ io.on("connection", (socket) => {
     io.to(roomId).emit("chat", { system: true, text: r.hostOnly ? "Host-only control is ON" : "Everyone can control playback" });
   });
 
-  // Chat: accepts both the old format (plain text) and the new one ({ room, name, text })
+  // ---- chat (accepts plain text or { room, name, text }) ----
   socket.on("chat", (msg, ack) => {
     const reply = (o) => typeof ack === "function" && ack(o);
     const isObj = msg && typeof msg === "object";
@@ -111,13 +108,35 @@ io.on("connection", (socket) => {
     reply({ ok: true });
   });
 
+  // ---- voice calling: the server only relays signaling, audio goes peer-to-peer ----
+  socket.on("voice-join", () => {
+    const r = rooms.get(roomId); if (!r) return;
+    const others = [...r.voice].filter((id) => id !== socket.id);
+    r.voice.add(socket.id);
+    socket.emit("voice-peers", others.map((id) => ({ id, name: r.members.get(id) })));
+    io.to(roomId).emit("chat", { system: true, text: `🎤 ${r.members.get(socket.id)} joined voice` });
+  });
+
+  socket.on("voice-leave", () => {
+    const r = rooms.get(roomId); if (!r || !r.voice.has(socket.id)) return;
+    r.voice.delete(socket.id);
+    socket.to(roomId).emit("voice-left", socket.id);
+    io.to(roomId).emit("chat", { system: true, text: `🔇 ${r.members.get(socket.id)} left voice` });
+  });
+
+  socket.on("signal", ({ to, data }) => {
+    const r = rooms.get(roomId); if (!r || !r.members.has(to)) return;
+    io.to(to).emit("signal", { from: socket.id, name: r.members.get(socket.id), data });
+  });
+
   socket.on("disconnect", () => {
     const r = rooms.get(roomId); if (!r) return;
     const name = r.members.get(socket.id);
+    if (r.voice.delete(socket.id)) socket.to(roomId).emit("voice-left", socket.id);
     r.members.delete(socket.id);
     r.waiting.delete(socket.id);
     if (r.members.size === 0) { clearTimeout(r.holdTimer); rooms.delete(roomId); return; }
-    if (r.hostId === socket.id) r.hostId = [...r.members.keys()][0]; // pass host to the next person
+    if (r.hostId === socket.id) r.hostId = [...r.members.keys()][0];
     sendUsers(roomId, r); sendRoom(roomId, r); updateWait(roomId, r);
     io.to(roomId).emit("chat", { system: true, text: `${name} left` });
   });
